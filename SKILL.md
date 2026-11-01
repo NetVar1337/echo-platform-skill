@@ -89,3 +89,11 @@ bool main() {
 - Target only processes you own or are authorized to analyze; don't use the platform to gain an unfair advantage in multiplayer games.
 - When writing scripts for a user, prefer sig scans + relative resolution over hardcoded offsets, and validate every read with the `bool` overloads.
 - Keep SKILL.md small: if you need the full signature list, read the matching reference file rather than the whole raw dump.
+
+## Companion resources (bundled — see BUNDLE.md)
+
+- Binary RE / decompilation / AoB scanning of the attached target → run [mcp-reverse](https://github.com/1llu50ry/mcp-reverse) as an MCP server (MIT, 180+ tools).
+- Anti-cheat / kernel / engine research background → install skills from [awesome-game-security](https://github.com/gmh5225/awesome-game-security) via `npx skills add`.
+- Windows driver attack-surface research → [BYOVD-AI-Guide](https://github.com/gmh5225/BYOVD-AI-Guide) (link only; authorized testing only).
+
+These are linked, not vendored (multi-GB repos). Use everything here only on software you own or are authorized to analyze.

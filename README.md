@@ -39,3 +39,11 @@ references/
 ## Responsible use
 
 Target only processes you own or are authorized to analyze. Do not use the platform to gain an unfair advantage in multiplayer games or to bypass anti-cheat in ways that harm other players.
+
+## Bundled companion resources
+
+See **[BUNDLE.md](BUNDLE.md)** — this skillpack pairs with three public repos (linked, not vendored, since each is multi-GB):
+
+- **[1llu50ry/mcp-reverse](https://github.com/1llu50ry/mcp-reverse)** (MIT) — MCP server for game RE: 180+ tools, 56 debug/decompiler backends, 4,200+ skills. Run it alongside your agent to analyze the binary your script attaches to.
+- **[gmh5225/awesome-game-security](https://github.com/gmh5225/awesome-game-security)** (MIT) — game-security resource list + installable agent skills (`npx skills add ... --skill reverse-engineering-tools` etc.).
+- **[gmh5225/BYOVD-AI-Guide](https://github.com/gmh5225/BYOVD-AI-Guide)** — Windows vulnerable-driver research guide. Reference link only; authorized testing only.
