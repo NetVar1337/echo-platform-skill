@@ -1,0 +1,3077 @@
+# Getting started
+
+The Universal API lets you build tools for any process, complete with a full renderer and direct memory access, without any complex project compilation.
+
+### LLM Usage
+
+Here is the [full documentation](https://echo-23.gitbook.io/angel/llms-full.txt) ready to be pasted into your AI / LLM of choice.
+
+### Requirements
+
+[Discord](https://discord.com/download) must be installed and running, with the overlay enabled and the legacy option disabled. After loading the Universal API, it will show up when you open a game and wait for the Discord overlay to show up.
+
+The overlay only supports borderless and windowed mode.
+
+<figure><img src="https://2295724383-files.gitbook.io/~/files/v0/b/gitbook-x-prod.appspot.com/o/spaces%2F8PWRDlfX014jqkFlnnqV%2Fuploads%2FO9ewTty0dRRUsLBnLkvV%2Fdiscord_overlay.png?alt=media&amp;token=f4b75b66-64c9-435a-8f71-c03af16492db" alt=""><figcaption></figcaption></figure>
+
+### Script location
+
+Every script is stored in your `AppData/Roaming` in the `scripts` folder. \
+After adding a new `.as` file please close and reopen the menu to refresh the list of scripts.\
+Example location: `C:\Users\username\AppData\Roaming\scripts`
+
+### Language
+
+[AngelScript](https://www.angelcode.com/angelscript/) is a C-style scripting language with syntax close to C++, designed to be embedded in applications and run at runtime. It pairs the comfort of a statically typed language with the flexibility of a script you can load and reload on the fly, while object handles and reference counting manage memory for you. For the complete language reference, see the official [AngelScript documentation](https://www.angelcode.com/angelscript/sdk/docs/manual/doc_script.html).
+
+### **Entrypoint**
+
+Every script must define `bool main()`. It's the entry point, and a script won't compile without it. Return `true` for success, or `false` to signal failure, which unloads the script.
+
+`on_unload()` is optional and runs when the script is unloaded. Use it for teardown like saving data, releasing external resources, or undoing any modifications made to the target process. You don't need to manually clear global arrays, handles, or other script objects, since reference counting cleans those up automatically when the script unloads.
+
+```cpp
+void on_unload() {
+    // ...
+}
+
+bool main() {
+    // ...
+    return true;
+}
+```
+
+
+# Multi-threading
+
+#### Thread creation
+
+```cpp
+// Ticking threads (tps 1-128) can only be created from main()
+// One-shot threads (tps 0) can be created from any context
+
+// Threads invoke a callback at a fixed tick rate (1-128 tps)
+// Drift-free by design, tick time accumulates each interval
+
+// Pass 0 as tps to run the callback once and exit
+// Useful for non-blocking work like file i/o or image loading
+
+// callback funcdef
+void thread_callback() {}
+
+void create_thread(int tps, thread_callback@ cb);
+void on_render(thread_callback@ cb);
+```
+
+#### Mutexes
+
+```cpp
+// Create a mutex for thread synchronization
+mutex@ create_mutex();
+
+// mutex methods
+mutex.lock();          // Acquire exclusive lock (blocks until available)
+mutex.unlock();        // Release exclusive lock
+mutex.try_lock();      // Try to acquire exclusive lock without blocking — returns bool
+mutex.lock_shared();   // Acquire shared lock (multiple readers allowed simultaneously)
+mutex.unlock_shared(); // Release shared lock
+```
+
+#### Atomics
+
+```cpp
+// Atomic types — lock-free thread-safe primitives
+// Operations use acquire/release memory ordering
+atomic_bool@ atomic_bool(bool value);
+atomic_int32@ atomic_int32(int value);
+atomic_uint32@ atomic_uint32(uint value);
+atomic_int64@ atomic_int64(int64 value);
+atomic_uint64@ atomic_uint64(uint64 value);
+atomic_float@ atomic_float(float value);
+atomic_double@ atomic_double(double value);
+
+.load();          // Returns the current value.
+.store(value);    // Updates value.
+.exchange(value); // Updates value, returns the previous value.
+
+// Atomically compares current value to expected - writes desired if they match.
+// Returns observed value (equals expected on success, differs on failure).
+.compare_exchange(expected, desired); -> T
+```
+
+#### First time using threads
+
+`main()` is where threads get set up. `create_thread(tps, cb)` runs a callback at a fixed tick rate, and `on_render(cb)` runs one on the render path. Each thread keeps calling its callback, so anything they share needs guarding.
+
+The example below runs a few threads at different rates, each touching shared state a different way: a counter behind a mutex, the same counter using `try_lock` so it never blocks, and a lock-free atomic counter. The render thread reads both and prints them every frame.
+
+```cpp
+mutex@ g_mutex = create_mutex();
+int g_shared_counter = 0;
+atomic_int32@ g_atomic_counter = atomic_int32(0);
+
+void fast_tick() {
+    g_mutex.lock();
+    g_shared_counter++;
+    g_mutex.unlock();
+}
+
+void slow_tick() {
+    if (g_mutex.try_lock()) {
+        g_shared_counter++;
+        g_mutex.unlock();
+    } 
+    else {
+        print("lock is busy");
+    }
+}
+
+void render_tick() {
+    g_mutex.lock_shared();
+    int shared = g_shared_counter;
+    g_mutex.unlock_shared();
+
+    int atomic = g_atomic_counter.load();
+    print("shared: " + shared + " atomic: " + atomic);
+}
+
+// Safe only because this is the single writer of g_atomic_counter.
+// A real read-modify-write across threads needs compare_exchange (see Atomics).
+void atomic_tick() {
+    g_atomic_counter.store(g_atomic_counter.load() + 1);
+}
+
+bool main() {
+    create_thread(128, @fast_tick);
+    create_thread(32, @slow_tick);
+    create_thread(64, @atomic_tick);
+    on_render(@render_tick);
+    return true;
+}
+```
+
+#### Sharing data between threads
+
+**Sharing data can be dangerous**
+
+**Unsynchronized global access.** Two threads sharing and updating the same global with no lock can race on the AngelScript engine internal state taking the entire process down with it.
+
+**Torn reads.** One thread reads an object while another is partway through updating it. The reader ends up with a mix of old and new values, say the new frame number but the old positions. The object is now in a state the reading code assumes can never happen.\
+\
+**How object handles make this easy**
+
+A handle in AngelScript is a counted reference to an object. The object stays alive as long as something holds a handle to it. Once the last handle goes away its reference count drops to zero and the object is reclaimed immediately. Copying a handle doesn't copy the object, it just points another reference at the same one and bumps the count.
+
+This makes a one-writer, many-reader setup easy. Readers each hold their own handle to the current snapshot, and the writer swaps in a new one without disturbing them.
+
+```cpp
+interface snapshot_t {}
+
+class shared_snapshot {
+    private snapshot_t@ current;
+    private mutex@ mtx;
+
+    shared_snapshot(snapshot_t@ initial) {
+        @current = initial;
+        @mtx = create_mutex();
+    }
+
+    // Publish a finished snapshot.
+    // Build it fully before calling this, then leave it alone.
+    // The swap takes an exclusive lock, so it briefly blocks readers,
+    // but only for the handle swap, never while a reader reads snapshot contents.
+    void publish(snapshot_t@ next) {
+        mtx.lock();
+        @current = next;
+        mtx.unlock();
+    }
+
+    // Hand back a reference to the current snapshot.
+    // The returned handle keeps that snapshot alive on its own.
+    // The caller can read it freely afterwards without holding any lock.
+    snapshot_t@ acquire() {
+        mtx.lock_shared();
+        snapshot_t@ snap = current;
+        mtx.unlock_shared();
+        return snap;
+    }
+}
+
+class entity {
+    string name;
+    int health;
+    int max_health;
+    vec3 world_pos;
+    int team_id;
+}
+
+// One frame's worth of entities.
+class game_snapshot : snapshot_t {
+    array<entity@> entities;
+}
+
+shared_snapshot@ g_state;
+
+// Set up the shared state once before any thread reads it.
+void init() {
+    @g_state = shared_snapshot(game_snapshot());
+}
+
+// Writer: build a fresh snapshot each tick, then publish it.
+void writer() {
+    game_snapshot next;
+
+    entity player_1;
+    player_1.name = "Peter";
+    player_1.health = 100;
+    player_1.max_health = 100;
+    player_1.world_pos = vec3(0.0f, 0.0f, 0.0f);
+    player_1.team_id = 0;
+    next.entities.insertLast(player_1);
+
+    entity player_2;
+    player_2.name = "John";
+    player_2.health = 75;
+    player_2.max_health = 100;
+    player_2.world_pos = vec3(0.0f, 0.0f, 0.0f);
+    player_2.team_id = 0;
+    next.entities.insertLast(player_2);
+
+    entity player_3;
+    player_3.name = "Judas";
+    player_3.health = 50;
+    player_3.max_health = 100;
+    player_3.world_pos = vec3(0.0f, 0.0f, 0.0f);
+    player_3.team_id = 1;
+    next.entities.insertLast(player_3);
+
+    g_state.publish(next);
+}
+
+// Reader: grab the current snapshot, cast to the real type, then read freely.
+void reader() {
+    game_snapshot@ snap = cast<game_snapshot>(g_state.acquire());
+    if (snap is null) {
+        return;
+    }
+
+    // no lock held here
+    for (uint i = 0; i < snap.entities.length(); i++) {
+        entity@ e = snap.entities[i];
+        print(e.name + " [team " + e.team_id + "]");
+        print("hp: " + e.health + "/" + e.max_health);
+        print("pos: (" + e.world_pos.x + ", " + e.world_pos.y + ", " + e.world_pos.z + ")");
+    }
+}
+```
+
+
+# Process
+
+```c++
+struct attach_data {
+    uint64 pid;          // Process ID
+    uint64 peb_address;  // PEB address
+    uint64 base_address; // Base address
+}
+
+struct module_entry {
+    string name; // Module name
+    uint64 base; // Base address
+    uint64 size; // Module size in bytes
+}
+
+struct memory_region {
+    uint64 base;     // Start of the contiguous region
+    uint64 size;     // Size of the region in bytes
+    bool present;    // True if pages are mapped
+    bool writable;   // Hardware write permission
+    bool executable; // Hardware execute permission (NX bit)
+};
+
+// The process api has direct access to physical memory.
+// Page protections and copy-on-write have no effect.
+// The target process is never injected into.
+attach_data process::attach(string name);
+attach_data process::attach(uint32 pid);
+
+// Detach from process
+void process::detach();
+
+// Checks if the process is still running
+bool alive = process::is_alive();
+
+// Read a region of memory into a buffer for efficient multi-field access
+// Returns null on failure
+memory_buffer@ process::read_buffer(uint64 address, uint64 size);
+
+// memory_buffer methods
+uint8 memory_buffer::read_uint8(uint64 offset);
+uint16 memory_buffer::read_uint16(uint64 offset);
+uint32 memory_buffer::read_uint32(uint64 offset);
+uint64 memory_buffer::read_uint64(uint64 offset);
+int8 memory_buffer::read_int8(uint64 offset);
+int16 memory_buffer::read_int16(uint64 offset);
+int32 memory_buffer::read_int32(uint64 offset);
+int64 memory_buffer::read_int64(uint64 offset);
+float memory_buffer::read_float(uint64 offset);
+double memory_buffer::read_double(uint64 offset);
+vec2 memory_buffer::read_vec2_float(uint64 offset);
+vec2 memory_buffer::read_vec2_double(uint64 offset);
+vec3 memory_buffer::read_vec3_float(uint64 offset);
+vec3 memory_buffer::read_vec3_double(uint64 offset);
+vec4 memory_buffer::read_vec4_float(uint64 offset);
+vec4 memory_buffer::read_vec4_double(uint64 offset);
+uint64 memory_buffer::size();
+
+// Read memory, returns default value on failure (0, 0.0, false, etc.)
+array<uint8>@ process::read_bytes(uint64 address, uint32 size);
+int8 process::read_int8(uint64 address);
+uint8 process::read_uint8(uint64 address);
+int16 process::read_int16(uint64 address);
+uint16 process::read_uint16(uint64 address);
+int32 process::read_int32(uint64 address);
+uint32 process::read_uint32(uint64 address);
+int64 process::read_int64(uint64 address);
+uint64 process::read_uint64(uint64 address);
+float process::read_float(uint64 address);
+double process::read_double(uint64 address);
+string process::read_string(uint64 address); // Null-terminated, 256 char max; use read_bytes for wide strings
+
+// Read memory, returns true on success, false on failure
+bool process::read_int8(uint64 address, int8 &out);
+bool process::read_uint8(uint64 address, uint8 &out);
+bool process::read_int16(uint64 address, int16 &out);
+bool process::read_uint16(uint64 address, uint16 &out);
+bool process::read_int32(uint64 address, int32 &out);
+bool process::read_uint32(uint64 address, uint32 &out);
+bool process::read_int64(uint64 address, int64 &out);
+bool process::read_uint64(uint64 address, uint64 &out);
+bool process::read_float(uint64 address, float &out);
+bool process::read_double(uint64 address, double &out);
+bool process::read_string(uint64 address, string &out);
+
+// Write memory, returns true on success, false on failure
+bool process::write_bytes(array<uint8> bytes, uint64 address);
+bool process::write_int8(uint64 address, int8 value);
+bool process::write_uint8(uint64 address, uint8 value);
+bool process::write_int16(uint64 address, int16 value);
+bool process::write_uint16(uint64 address, uint16 value);
+bool process::write_int32(uint64 address, int32 value);
+bool process::write_uint32(uint64 address, uint32 value);
+bool process::write_int64(uint64 address, int64 value);
+bool process::write_uint64(uint64 address, uint64 value);
+bool process::write_float(uint64 address, float value);
+bool process::write_double(uint64 address, double value);
+
+// Returns the contiguous region of pages with uniform flags containing the given address.
+// When present is false, base/size still describe the unmapped hole. Use base + size
+// to advance to the next region and enumerate all regions including gaps.
+memory_region process::virtual_query(uint64 address);
+
+// Module utilities
+uint64 process::get_module_base(string name);                // Returns 0 if not found
+uint32 process::get_module_size(uint64 base);                // Returns 0 if not found
+uint64 process::get_module_export(uint64 base, string name); // Returns 0 if not found
+array<module_entry>@ process::get_module_list();
+
+// Pattern scanning, returns 0 if not found
+uint64 process::find_signature(uint64 base, string sig, string mask);
+uint64 process::find_signature(
+    uint64 base, string sig, string mask, 
+    uint64 range_offset, uint64 range_length
+);
+
+array<uint64>@ process::find_signatures(uint64 base, string sig, string mask);
+array<uint64>@ process::find_signatures(
+    uint64 base, string sig, string mask, 
+    uint64 range_offset, uint64 range_length
+);
+
+// IDA-style pattern scanning
+uint64 process::find_signature(uint64 base, string sig);
+uint64 process::find_signature(
+    uint64 base, string sig, 
+    uint64 range_offset, uint64 range_length
+);
+
+array<uint64>@ process::find_signatures(uint64 base, string sig);
+array<uint64>@ process::find_signatures(
+    uint64 base, string sig, 
+    uint64 range_offset, uint64 range_length
+);
+
+// Resolve relative address from instruction
+uint64 process::get_relative_address(uint64 address, uint32 offset, uint32 inst_size);
+
+// Dump to file, all dumps saved to the "dmp" folder inside the scripts folder
+bool process::dump(string filename); // Dump main executable
+bool process::dump(string module_name, string filename); // Dump specific module
+```
+
+#### Process socket
+
+```cpp
+// Opens a WebSocket connection to the given URL and starts a background
+// receive loop. Requires a process to be attached before calling.
+// Returns false if no process is attached or a connection is already active.
+// Only one connection may be open at a time.
+
+// All communication is JSON over UTF-8 WebSocket frames. Every request
+// must include a "type" string and an optional integer "id" (defaults to 0),
+// which is sent back in all responses for correlating replies.
+bool process::open_socket(const string url);
+```
+
+### Socket routes
+
+#### Ping
+
+```json
+// Request
+{ "type": "ping", "id": 1 }
+
+// Response
+{
+  "type": "ping_result",
+  "id": 1,
+  "attached": true,
+  "pid": 1234,
+  "base": "0x7ff600000000"
+}
+
+// pid and base are omitted when attached is false.
+```
+
+#### Read
+
+```cpp
+// Request
+{
+  "type": "read",
+  "id": 2,
+  "address": "0x7ff600001000",
+  "size": 16
+}
+
+// Response
+{
+  "type": "read_result",
+  "id": 2,
+  "success": true,
+  "address": "0x7ff600001000",
+  "size": 16,
+  "data": "48895c2408574883ec20..."
+}
+
+// data is a lowercase hex string.
+// On failure success is false, size is 0, and data is empty.
+```
+
+#### Read batch
+
+```json
+// Request
+{
+  "type": "read_batch",
+  "id": 3,
+  "reads": [
+    { "address": "0x7ff600001000", "size": 8 },
+    { "address": "0x7ff600002000", "size": 4 }
+  ]
+}
+
+// Response
+{
+  "type": "read_batch_result",
+  "id": 3,
+  "success": true,
+  "results": [
+    { "success": true,  "address": "0x7ff600001000", "data": "4883ec28..." },
+    { "success": false, "address": "0x7ff600002000", "data": "" }
+  ]
+}
+
+// Per-entry size limit is 0x10000 (64 KiB).
+// The outer success is always true if the batch was processed.
+```
+
+#### Modules
+
+```json
+// Request
+{ "type": "modules", "id": 4 }
+
+// Response
+{
+  "type": "modules_result",
+  "id": 4,
+  "success": true,
+  "modules": [
+    { "name": "game.exe",  "base": "0x7ff600000000", "size": 10485760 },
+    { "name": "ntdll.dll", "base": "0x7ffd10000000", "size": 2097152  }
+  ]
+}
+```
+
+#### Signature scanning
+
+```json
+// Request
+{
+  "type": "sig_scan",
+  "id": 5,
+  "sig": "4883ec28ff15",
+  "mask": "xxxxxx",
+  "module": "game.exe",
+  "find_all": false
+}
+
+// Response
+{
+  "type": "sig_scan_result",
+  "id": 5,
+  "success": true,
+  "results": ["0x7ff600012340"],
+  "module": "game.exe",
+  "sig": "4883ec28ff15",
+  "mask": "xxxxxx"
+}
+
+// sig is hex-encoded bytes, mask uses x to match and ? to wildcard.
+// module defaults to the main executable if omitted.
+// success is true only if at least one result was found.
+```
+
+#### Signature scanning \[IDA]
+
+```json
+// Request
+{
+  "type": "sig_scan_ida",
+  "id": 6,
+  "pattern": "48 83 EC 28 FF 15 ? ? ? ? 85 C0",
+  "module": "game.exe",
+  "find_all": false
+}
+
+// Response
+{
+  "type": "sig_scan_ida_result",
+  "id": 6,
+  "success": true,
+  "results": ["0x7ff600012340"],
+  "module": "game.exe",
+  "pattern": "48 83 EC 28 FF 15 ? ? ? ? 85 C0"
+}
+
+// Wildcards are ? or ??.
+```
+
+#### String scanning
+
+```json
+// Request
+{
+  "type": "string_scan",
+  "id": 7,
+  "text": "PlayerController",
+  "module": "game.exe",
+  "find_all": true
+}
+
+// Response
+{
+  "type": "string_scan_result",
+  "id": 7,
+  "success": true,
+  "results": ["0x7ff601a04bc0", "0x7ff601a08210"],
+  "module": "game.exe",
+  "text": "PlayerController"
+}
+```
+
+#### Resolve relative
+
+```json
+// Request
+{
+  "type": "resolve_relative",
+  "id": 8,
+  "address": "0x7ff600012340",
+  "offset": 3,
+  "inst_size": 7
+}
+
+// Response
+{
+  "type": "resolve_relative_result",
+  "id": 8,
+  "success": true,
+  "address": "0x7ff60001f000"
+}
+
+// offset and inst_size default to 0 if omitted.
+```
+
+#### RTTI resolve
+
+```json
+// Request
+{
+  "type": "rtti_resolve",
+  "id": 9,
+  "address": "0x1f3a0000b40"
+}
+
+// Response
+{
+  "type": "rtti_resolve_result",
+  "id": 9,
+  "success": true,
+  "address": "0x1f3a0000b40",
+  "name": "class PlayerController"
+}
+```
+
+#### RTTI resolve batch
+
+```json
+// Request
+{
+  "type": "rtti_resolve_batch",
+  "id": 10,
+  "addresses": [
+    "0x1f3a0000b40",
+    "0x1f3a0001c80"
+  ]
+}
+
+// Response
+{
+  "type": "rtti_resolve_batch_result",
+  "id": 10,
+  "success": true,
+  "results": [
+    { "success": true,  "name": "class PlayerController" },
+    { "success": false, "name": "" }
+  ]
+}
+
+// Results are returned in the same order as the input array.
+```
+
+#### Enumerate functions
+
+```json
+// Request
+{
+  "type": "enumerate_functions",
+  "id": 11,
+  "module": "game.exe"
+}
+
+// Response
+{
+  "type": "enumerate_functions_result",
+  "id": 11,
+  "success": true,
+  "module": "game.exe",
+  "count": 2,
+  "results": [
+    { "address": "0x7ff600001000", "size": 128, "method": 0 },
+    { "address": "0x7ff600001080", "size": 64,  "method": 1 }
+  ]
+}
+```
+
+#### Disassemble
+
+```json
+// Request
+{
+  "type": "disassemble",
+  "id": 12,
+  "address": "0x7ff600001000",
+  "size": 64
+}
+
+// Response
+{
+  "type": "disassemble_result",
+  "id": 12,
+  "success": true,
+  "complete": true,
+  "address": "0x7ff600001000",
+  "count": 2,
+  "results": [
+    { "address": "0x7ff600001000", "length": 4, "bytes": "4883ec28",     "text": "sub rsp, 0x28" },
+    { "address": "0x7ff600001004", "length": 6, "bytes": "ff1500000000", "text": "call qword ptr [rip+0x0]" }
+  ]
+}
+
+// size defaults to 0 if omitted, the backend determines the extent automatically.
+// complete indicates whether disassembly reached a natural endpoint.
+```
+
+#### Error
+
+```json
+// Returned in place of the normal result whenever a request fails.
+{
+  "type": "error",
+  "id": 1,
+  "code": 1002,
+  "message": "invalid or missing arguments",
+  "detail": "read requires 'address' and 'size'"
+}
+
+// Error codes:
+// 1000 - unknown message type
+// 1001 - not attached to a process
+// 1002 - invalid or missing arguments
+// 1003 - module not found
+// 1004 - size out of range (1..1048576)
+// 1005 - memory read failed
+// 1006 - function enumeration failed
+// 1007 - disassembly failed
+```
+
+
+# Zydis Disasm
+
+Bindings for Zydis the x86-64 disassembler. Decoded instructions are returned as reference-counted disasm\_insn handles; operands are value-type disasm\_operand structs.
+
+#### Types
+
+```cpp
+// operand type
+op_type::unused
+op_type::reg
+op_type::mem
+op_type::ptr
+op_type::imm
+
+// operand visibility
+op_visibility::invalid
+op_visibility::explicit
+op_visibility::implicit
+op_visibility::hidden
+
+// operand action flags
+op_action::read
+op_action::write
+op_action::readwrite
+op_action::condread
+op_action::condwrite
+op_action::read_condwrite
+op_action::condread_write
+
+struct disasm_operand {
+    int type;            // op_type value
+    int visibility;      // op_visibility value
+    int action;          // op_action bitmask
+    int reg;             // valid when type == op_type::reg; pass to zydis::reg_name()
+    bool imm_is_signed;  // valid when type == op_type::imm
+    bool imm_is_relative;
+    uint64 imm_value;
+    int mem_segment;     // valid when type == op_type::mem
+    int mem_base;
+    int mem_index;
+    uint8 mem_scale;
+    int64 mem_disp;
+    bool mem_has_disp;
+}
+
+// reference counted; returned in output array by disasm / disasm_func
+struct disasm_insn {
+    uint64 runtime_address; // base address; rip-relative operands resolve against this
+    uint8 length;           // encoded byte length
+    int mnemonic;           // raw Zydis mnemonic id
+    string text;            // Intel-syntax disassembly
+    uint8 operand_count;    // includes implicit and hidden operands
+    uint8 operand_count_visible;
+    
+    // returns default operand if idx is out of range
+    disasm_operand get_op(uint8 idx) const;
+}
+```
+
+#### API Definitions
+
+```cpp
+// returns the register name string from disasm_operand::reg
+string zydis::reg_name(int reg)
+
+// disassemble all bytes
+// rip sets the base address; affects display and resolves rip-relative operands
+bool zydis::disasm(const array<uint8>@ &in bytes, array<disasm_insn@> &out insns)
+bool zydis::disasm(const array<uint8>@ &in bytes, uint64 rip, array<disasm_insn@> &out insns)
+
+// disassemble until the first ret/iret
+// returns false if the instruction limit (4096) is reached without a return
+bool zydis::disasm_func(const array<uint8>@ &in bytes, array<disasm_insn@> &out insns)
+bool zydis::disasm_func(const array<uint8>@ &in bytes, uint64 rip, array<disasm_insn@> &out insns)
+```
+
+#### Usage example
+
+```cpp
+void print_simple(disasm_insn@ insn) {
+    print(insn.text);
+}
+
+void print_detailed(disasm_insn@ insn) {
+    print("[" + util::to_hex(insn.runtime_address) + "] " + insn.text + " [len=" + insn.length + " ops=" + insn.operand_count_visible + "]\n");
+
+    for (uint8 j = 0; j < insn.operand_count_visible; j++) {
+        disasm_operand op = insn.get_op(j);
+        string s = "op[" + j + "] ";
+
+        switch (op.type) {
+        case op_type::reg: {
+            s += "reg=" + zydis::reg_name(op.reg);
+            break;
+        }
+        case op_type::imm: {
+            s += "imm=" + util::to_hex(op.imm_value);
+            if (op.imm_is_relative) {
+                s += " (rel)";
+            }
+            if (op.imm_is_signed) {
+                s += " (signed)";
+            }
+            break;
+        }
+        case op_type::mem: {
+            s += "mem [";
+            if (op.mem_base != 0) {
+                s += "base=" + op.mem_base + " ";
+            }
+            if (op.mem_index != 0) {
+                s += "index=" + op.mem_index + " scale=" + op.mem_scale + " ";
+            }
+            if (op.mem_has_disp) {
+                s += "disp=" + util::to_hex(uint64(op.mem_disp));
+            }
+            s += "]";
+            break;
+        }
+        }
+
+        print(s);
+    }
+}
+
+bool main() {
+    if (process::attach("process_name.exe").pid == 0) {
+        print("failed to attach to process");
+        return false;
+    }
+
+    uint64 ntdll = process::get_module_base("ntdll.dll");
+    if (ntdll == 0) {
+        print("failed to get ntdll base");
+        return false;
+    }
+
+    uint64 target = process::get_module_export(ntdll, "NtCreateFile");
+    if (target == 0) {
+        print("failed to find NtCreateFile");
+        return false;
+    }
+
+    array<uint8>@ bytes = process::read_bytes(target, 256);
+    if (bytes is null) {
+        print("failed to read bytes");
+        return false;
+    }
+
+    array<disasm_insn@> insns;
+    if (!zydis::disasm_func(bytes, target, insns)) {
+        print("disassembling failed");
+        return false;
+    }
+
+    print("NtCreateFile");
+    for (uint32 i = 0; i < insns.length(); i++) {
+        print_simple(insns[i]);
+    }
+
+    print(""); // Seperator
+    print("Detailed output:");
+    for (uint32 i = 0; i < insns.length(); i++) {
+        print_detailed(insns[i]);
+    }
+
+    return true;
+}
+```
+
+
+# Unicorn Emulator
+
+Bindings for the Unicorn CPU emulator
+
+Note: Emulator handles are opaque `uint64` values returned by `uc::create()` or `uc::create_process()` - a handle of `0` means creation failed. Call `uc::close(h)` when you're done to release memory mappings and hooks; any handles left open are automatically cleaned up on script unload. The emulator is x86\_64 - there is no mode parameter, and all register access goes through `x86_reg`.
+
+#### Types
+
+```cpp
+struct uc_memory_region {
+    uint64 address;
+    uint64 end;
+    uint32 perms;
+};
+
+// memory protection flags (bitwise OR combinable)
+uc::prot::none
+uc::prot::read
+uc::prot::write
+uc::prot::exec
+uc::prot::all
+
+// memory access type passed to hook_memory_unmapped callbacks
+uc::mem_type::read
+uc::mem_type::write
+uc::mem_type::fetch
+uc::mem_type::read_unmapped
+uc::mem_type::write_unmapped
+uc::mem_type::fetch_unmapped
+uc::mem_type::read_prot
+uc::mem_type::write_prot
+uc::mem_type::fetch_prot
+
+// error codes returned by uc::start()
+uc::error::ok
+uc::error::nomem
+uc::error::arch
+uc::error::handle
+uc::error::mode
+uc::error::version
+uc::error::read_unmapped
+uc::error::write_unmapped
+uc::error::fetch_unmapped
+uc::error::fetch_prot
+uc::error::read_prot
+uc::error::write_prot
+uc::error::map
+uc::error::hook
+uc::error::insn_invalid
+```
+
+#### Registers
+
+```cpp
+// general purpose
+x86_reg::rax
+x86_reg::rbx
+x86_reg::rcx
+x86_reg::rdx
+x86_reg::rsi
+x86_reg::rdi
+x86_reg::rbp
+x86_reg::rsp
+x86_reg::rip
+x86_reg::eflags
+x86_reg::r8 .. x86_reg::r15
+
+// segment
+x86_reg::cs
+x86_reg::ds
+x86_reg::es
+x86_reg::fs
+x86_reg::gs
+x86_reg::ss
+x86_reg::fs_base
+x86_reg::gs_base
+
+// control
+x86_reg::mxcsr  // SSE control/status
+
+// SSE 128-bit - use reg_read128 / reg_write128
+x86_reg::xmm0 .. x86_reg::xmm15
+
+// AVX 256-bit - low 128 bits alias xmmN, use reg_read256 / reg_write256
+x86_reg::ymm0 .. x86_reg::ymm15
+```
+
+#### API Definitions
+
+```cpp
+// callback funcdefs, return false to stop emulation
+bool code_hook_fn(uint64 h, uint64 address, uint32 size) {}
+bool mem_hook_fn(uint64 h, uc::mem_type type, uint64 address, uint32 size, uint64 value) {}
+
+// create returns 0 on failure; close releases the handle and all its hooks
+uint64 uc::create();
+
+// creates an emulator handle backed by the currently attached process (see process::attach())
+// pages are faulted in on demand using the process virtual memory layout, mapped at region granularity
+// with correct Win32 protection flags; if a region overlaps an already-mapped area, only the faulting
+// page is mapped instead. write faults to unmapped regions are not auto-mapped and will stop emulation.
+// the process is never modified. returns 0 if no process is currently attached
+uint64 uc::create_process();
+
+// releases the handle and all associated memory mappings and hooks
+void uc::close(uint64 h);
+
+// maps a stack region and sets rsp to the top
+// writes stop_address there so ret halts emulation
+bool uc::setup_stack(uint64 h, uint64 base, uint64 size, uint64 stop_address);
+
+// run emulation; timeout in microseconds, count in instructions (0 = unlimited)
+// returns a uc::error value; uc::error::ok on clean exit
+int uc::start(uint64 h, uint64 begin, uint64 end, uint64 timeout = 0, uint64 count = 0);
+
+// stop a running emulation from within a hook
+void uc::stop(uint64 h);
+
+// invalidate the internal translation cache after self-modifying code
+bool uc::flush_code(uint64 h);
+
+// last error code and fault address after a failed start()
+uint32 uc::last_error(uint64 h);
+uint64 uc::fault_address(uint64 h);
+
+// attach hooks; begin > end (the default) means the hook fires for all addresses
+bool uc::hook_code(uint64 h, code_hook_fn@ cb, uint64 begin = 1, uint64 end = 0);
+bool uc::hook_memory_unmapped(uint64 h, mem_hook_fn@ cb, uint64 begin = 1, uint64 end = 0);
+
+// 64-bit general purpose registers
+bool uc::reg_read64(uint64 h, x86_reg reg, uint64 &out val);
+bool uc::reg_write64(uint64 h, x86_reg reg, uint64 val);
+
+// 128-bit xmm - array must be exactly 16 bytes
+bool uc::reg_read128(uint64 h, x86_reg reg, array<uint8> &out data);
+bool uc::reg_write128(uint64 h, x86_reg reg, const array<uint8> &in data);
+
+// 256-bit ymm - array must be exactly 32 bytes
+bool uc::reg_read256(uint64 h, x86_reg reg, array<uint8> &out data);
+bool uc::reg_write256(uint64 h, x86_reg reg, const array<uint8> &in data);
+
+// map/unmap regions and change protection flags
+bool uc::mem_map(uint64 h, uint64 address, uint64 size, uint perms);
+bool uc::mem_unmap(uint64 h, uint64 address, uint64 size);
+bool uc::mem_protect(uint64 h, uint64 address, uint64 size, uint perms);
+
+// read/write bytes
+bool uc::mem_write(uint64 h, uint64 address, const array<uint8> &in data);
+bool uc::mem_read(uint64 h, uint64 address, uint32 size, array<uint8> &out data);
+
+// returns the uc::prot bitmask for the region containing `address`, or -1 if unmapped
+// for create_process() handles, if the address is not yet mapped in the emulator,
+// falls back to querying the host process protection and returns the equivalent uc::prot bitmask
+int uc::mem_query(uint64 h, uint64 address);
+
+// fills `regions` with every currently mapped region
+bool uc::mem_regions(uint64 h, array<uc_memory_region> &out regions);
+```
+
+#### Pointer decryption
+
+```cpp
+bool main() {
+    uint64 h = uc::create();
+    if (h == 0) {
+        return false;
+    }
+
+    const uint64 code_base = 0x1000;
+    const uint64 stop_base = 0x2000;
+
+    uc::mem_map(h, code_base, 0x1000, uc::prot::read | uc::prot::exec);
+    uc::mem_map(h, stop_base, 0x1000, uc::prot::read | uc::prot::exec);
+    uc::setup_stack(h, 0x10000, 0x2000, stop_base);
+
+    // ror(ptr ^ key, 0x11)
+    array<uint8> code = {
+        0x49, 0xb8, 0xef, 0xbe, 0xad, 0xde, 0x00, 0x00, 0x00, 0x00, // mov r8, 0xdeadbeef
+        0x4c, 0x33, 0xc0,                                           // xor rax, r8
+        0x48, 0xc1, 0xc8, 0x11,                                     // ror rax, 17
+        0xc3                                                        // ret
+    };
+    uc::mem_write(h, code_base, code);
+
+    uint64 encrypted = 0x4f6e3a2b1c0d9e8f;
+    uc::reg_write64(h, x86_reg::rax, encrypted);
+
+    int result = uc::start(h, code_base, stop_base);
+    if (result != uc::error::ok) {
+        uc::close(h);
+        return false;
+    }
+
+    uint64 decrypted = 0;
+    uc::reg_read64(h, x86_reg::rax, decrypted);
+    print("encrypted: 0x" + formatInt(encrypted, "0H", 16));
+    print("decrypted: 0x" + formatInt(decrypted, "0H", 16));
+
+    uc::close(h);
+    return true;
+}
+```
+
+#### PEB module enumeration
+
+```cpp
+bool main() {
+    if (process::attach("process_name.exe", false).pid == 0) {
+        print("process not found");
+        return false;
+    }
+
+    uint64 h = uc::create_process();
+    if (h == 0) {
+        return false;
+    }
+
+    uc::mem_map(h, 0x1000, 0x3000, uc::prot::all);
+    uc::setup_stack(h, 0x4000, 0x2000, 0x6000);
+
+    // gs:[0x60] -> PEB -> Ldr -> &InLoadOrderModuleList (sentinel in rcx, first entry in rdi)
+    array<uint8> stub_init = {
+        0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00, // mov rax, gs:[0x60]
+        0x48, 0x8B, 0x40, 0x18,                               // mov rax, [rax+0x18]
+        0x48, 0x8D, 0x40, 0x10,                               // lea rax, [rax+0x10]
+        0x48, 0x89, 0xC1,                                     // mov rcx, rax
+        0x48, 0x8B, 0x38,                                     // mov rdi, [rax]
+        0xC3
+    };
+
+    // rdi = LDR_DATA_TABLE_ENTRY, reads DllBase/EntryPoint/SizeOfImage, advances rdi to next entry
+    array<uint8> stub_read = {
+        0x48, 0x8B, 0x47, 0x30, // mov rax, [rdi+0x30]
+        0x48, 0x8B, 0x5F, 0x38, // mov rbx, [rdi+0x38]
+        0x8B, 0x4F, 0x40,       // mov ecx, [rdi+0x40]
+        0x48, 0x8B, 0x3F,       // mov rdi, [rdi]
+        0xC3
+    };
+
+    uc::mem_write(h, 0x1000, stub_init);
+    uc::mem_write(h, 0x2000, stub_read);
+
+    uc::start(h, 0x1000, 0x6000);
+    uint64 sentinel = 0;
+    uint64 flink = 0;
+    uc::reg_read64(h, x86_reg::rcx, sentinel);
+    uc::reg_read64(h, x86_reg::rdi, flink);
+
+    int idx = 0;
+    while (flink != sentinel && flink != 0) {
+        uc::reg_write64(h, x86_reg::rdi, flink);
+        uc::start(h, 0x2000, 0x6000);
+
+        uint64 dll_base = 0;
+        uint64 entry_point = 0;
+        uint64 size_of_image = 0;
+        uint64 next = 0;
+        uc::reg_read64(h, x86_reg::rax, dll_base);
+        uc::reg_read64(h, x86_reg::rbx, entry_point);
+        uc::reg_read64(h, x86_reg::rcx, size_of_image);
+        uc::reg_read64(h, x86_reg::rdi, next);
+
+        print("[" + idx + "] DllBase: 0x" + formatInt(dll_base, "0H", 16) + " EntryPoint: 0x" + formatInt(entry_point, "0H", 16) + " SizeOfImage: 0x" + formatInt(size_of_image, "0H", 8));
+
+        flink = next;
+        idx++;
+    }
+
+    uc::close(h);
+    return true;
+}
+```
+
+
+# SIMD & Bit Operations
+
+Low-level CPU intrinsic bindings for bit manipulation and SSE integer operations - useful for rotations, byte swaps, and vectorized arithmetic.
+
+**Note:** All SSE functions require `array<uint8>` of exactly 16 bytes (128 bits).
+
+### Bit Rotation
+
+```cpp
+// rotate bits left (rol) or right (ror) with wrap-around
+uint8 rol8(uint8 value, int count);
+uint8 ror8(uint8 value, int count);
+uint16 rol16(uint16 value, int count);
+uint16 ror16(uint16 value, int count);
+uint32 rol32(uint32 value, int count);
+uint32 ror32(uint32 value, int count);
+uint64 rol64(uint64 value, int count);
+uint64 ror64(uint64 value, int count);
+```
+
+### Byte Swap
+
+```cpp
+// reverse byte order (endianness conversion)
+uint16 bswap16(uint16 value);
+uint32 bswap32(uint32 value);
+uint64 bswap64(uint64 value);
+```
+
+### Bit Manipulation
+
+```cpp
+// population count (number of set bits)
+int popcnt32(uint32 value);
+int popcnt64(uint64 value);
+
+// leading zero count (from MSB)
+int lzcnt32(uint32 value);
+int lzcnt64(uint64 value);
+
+// trailing zero count (from LSB)
+int tzcnt32(uint32 value);
+int tzcnt64(uint64 value);
+```
+
+### SSE Logical Operations
+
+```cpp
+void mm_xor_si128(array<uint8> a, array<uint8> b, array<uint8> &out result);    // a ^ b
+void mm_or_si128(array<uint8> a, array<uint8> b, array<uint8> &out result);     // a | b
+void mm_and_si128(array<uint8> a, array<uint8> b, array<uint8> &out result);    // a & b
+void mm_andnot_si128(array<uint8> a, array<uint8> b, array<uint8> &out result); // (~a) & b
+```
+
+### SSE Shift Operations
+
+```cpp
+void mm_slli_epi16(array<uint8> a, int imm8, array<uint8> &out result); // 8 x int16 << imm8
+void mm_srli_epi16(array<uint8> a, int imm8, array<uint8> &out result); // 8 x int16 >> imm8
+void mm_slli_epi32(array<uint8> a, int imm8, array<uint8> &out result); // 4 x int32 << imm8
+void mm_srli_epi32(array<uint8> a, int imm8, array<uint8> &out result); // 4 x int32 >> imm8
+void mm_slli_epi64(array<uint8> a, int imm8, array<uint8> &out result); // 2 x int64 << imm8
+void mm_srli_epi64(array<uint8> a, int imm8, array<uint8> &out result); // 2 x int64 >> imm8
+
+void mm_slli_si128(array<uint8> a, int imm8, array<uint8> &out result); // a << (imm8 * 8)
+void mm_srli_si128(array<uint8> a, int imm8, array<uint8> &out result); // a >> (imm8 * 8)
+```
+
+### SSE Shuffle Operations
+
+```cpp
+void mm_shuffle_epi8(array<uint8> a, array<uint8> b, array<uint8> &out result); // pshufb (mask bit 7 zeros the byte)
+void mm_shuffle_epi32(array<uint8> a, int imm8, array<uint8> &out result);   // pshufd  (permute 4 x int32)
+void mm_shufflehi_epi16(array<uint8> a, int imm8, array<uint8> &out result); // pshufhw (shuffle high 4 x int16)
+void mm_shufflelo_epi16(array<uint8> a, int imm8, array<uint8> &out result); // pshuflw (shuffle low 4 x int16)
+```
+
+### SSE Unpack Operations
+
+```cpp
+void mm_unpackhi_epi8(array<uint8> a, array<uint8> b, array<uint8> &out result);  // interleave high 8 bytes
+void mm_unpackhi_epi16(array<uint8> a, array<uint8> b, array<uint8> &out result); // interleave high 4 x int16
+void mm_unpackhi_epi32(array<uint8> a, array<uint8> b, array<uint8> &out result); // interleave high 2 x int32
+void mm_unpackhi_epi64(array<uint8> a, array<uint8> b, array<uint8> &out result); // interleave high 1 x int64
+
+void mm_unpacklo_epi8(array<uint8> a, array<uint8> b, array<uint8> &out result);  // interleave low 8 bytes
+void mm_unpacklo_epi16(array<uint8> a, array<uint8> b, array<uint8> &out result); // interleave low 4 x int16
+void mm_unpacklo_epi32(array<uint8> a, array<uint8> b, array<uint8> &out result); // interleave low 2 x int32
+void mm_unpacklo_epi64(array<uint8> a, array<uint8> b, array<uint8> &out result); // interleave low 1 x int64
+```
+
+### SSE Arithmetic
+
+```cpp
+void mm_add_epi8(array<uint8> a, array<uint8> b, array<uint8> &out result); // add 16 x int8
+void mm_add_epi16(array<uint8> a, array<uint8> b, array<uint8> &out result); // add 8 x int16
+void mm_add_epi32(array<uint8> a, array<uint8> b, array<uint8> &out result); // add 4 x int32
+void mm_add_epi64(array<uint8> a, array<uint8> b, array<uint8> &out result); // add 2 x int64
+
+void mm_sub_epi8(array<uint8> a, array<uint8> b, array<uint8> &out result); // subtract 16 x int8
+void mm_sub_epi16(array<uint8> a, array<uint8> b, array<uint8> &out result); // subtract 8 x int16
+void mm_sub_epi32(array<uint8> a, array<uint8> b, array<uint8> &out result); // subtract 4 x int32
+void mm_sub_epi64(array<uint8> a, array<uint8> b, array<uint8> &out result); // subtract 2 x int64
+
+void mm_mullo_epi16(array<uint8> a, array<uint8> b, array<uint8> &out result); // multiply 8 x int16 (low 16 bits)
+void mm_mullo_epi32(array<uint8> a, array<uint8> b, array<uint8> &out result); // multiply 4 x int32 (low 32 bits)
+```
+
+### SSE Set & Broadcast
+
+```cpp
+void mm_setzero_si128(array<uint8> &out result); // result = { 0 ... }
+
+void mm_set_epi64x(int64 e1, int64 e0, array<uint8> &out result); // result = [e1, e0]
+void mm_set_epi32(int32 e3, int32 e2, int32 e1, int32 e0, array<uint8> &out result); // result = [e3, e2, e1, e0]
+
+void mm_set1_epi64x(int64 a, array<uint8> &out result); // broadcast int64 to 2 lanes
+void mm_set1_epi32(int32 a, array<uint8> &out result);  // broadcast int32 to 4 lanes
+void mm_set1_epi16(int16 a, array<uint8> &out result);  // broadcast int16 to 8 lanes
+void mm_set1_epi8(int8 a, array<uint8> &out result);    // broadcast int8 to 16 lanes
+
+void broadcast_qword(uint64 a, array<uint8> &out result); // broadcast uint64 to 2 lanes
+void broadcast_dword(uint32 a, array<uint8> &out result); // broadcast uint32 to 4 lanes
+```
+
+### SSE Extract
+
+```cpp
+int64 mm_extract_epi64(array<uint8> a, int index); // index: 0..1
+int mm_extract_epi32(array<uint8> a, int index);   // index: 0..3
+int mm_extract_epi16(array<uint8> a, int index);   // index: 0..7  (zero-extended)
+int mm_extract_epi8(array<uint8> a, int index);    // index: 0..15 (zero-extended)
+```
+
+### SSE Compare
+
+```cpp
+// result array contains: 0xFF = matching, 0x00 = non-matching
+void mm_cmpeq_epi8(array<uint8> a, array<uint8> b, array<uint8> &out result); // compare 16 x int8
+void mm_cmpeq_epi16(array<uint8> a, array<uint8> b, array<uint8> &out result); // compare 8 x int16
+void mm_cmpeq_epi32(array<uint8> a, array<uint8> b, array<uint8> &out result); // compare 4 x int32
+```
+
+
+# Render
+
+Function calls are only available from within the rendering threads context. Unless explicitly marked otherwise.
+
+#### General
+
+```cpp
+// Callable from any context
+// Returns overlay framerate and frametime
+float render::get_fps();
+float render::get_frametime();
+
+// Callable from any context
+// Returns true when rendering is visible on-screen
+bool render::is_foreground();
+
+// Callable from any context
+// Gets viewport size as vec2
+vec2 render::get_viewport_size();
+
+// Callable from any context
+// Gets viewport size as output parameters
+bool render::get_viewport_size(int &out width, int &out height);
+
+// Enables or disables anti-aliasing for the current frame
+// Can be toggled on / off in-between drawing calls freely
+void render::set_anti_aliasing(bool enabled);
+```
+
+#### Fonts
+
+```cpp
+enum fonts {
+    PROGGY,
+    TAHOMA,
+    TAHOMA_PX,
+    TAHOMA_BOLD,
+    TAHOMA_BOLD_PX,
+    SMALLEST_PIXEL_7,
+    TAHOMISH
+};
+
+enum font_hint {
+    NONE,
+    AUTO,
+    MONO
+};
+
+struct font_handle {
+    int index;
+}
+
+// Callable from any context
+bool render::load_font(
+    const array<uint8> &in, 
+    font_handle &out, 
+    font_hint = font_hint::AUTO
+)
+
+// Only callable from the render context
+void render::update_font(font_handle font, int size);
+void render::update_font(fonts font, int size);
+```
+
+#### Images
+
+```cpp
+// Callable from any context
+bool render::load_image(string data, image &out obj);
+
+// Only callable from the rendering threads context
+void render::draw_image(image obj, int x, int y, int w, int h);
+void render::draw_image(image obj, int x, int y, int w, int h, int r, int g, int b, int a);
+
+// Usage example:
+image dino;
+void render_tick() {
+    render::draw_image(dino, 200, 200, 64, 64);
+}
+
+bool main() {
+    string image_data;
+    if (!file::read("dinosaur.png", image_data)) {
+        return false;
+    }
+    
+    if (!render::load_image(image_data, dino)) {
+        return false;
+    }
+    
+    on_render(@render_tick);
+    return true;
+}
+```
+
+#### Text
+
+```cpp
+// Updates the current font
+void render::update_font(fonts font, int size);
+
+// Calculates text dimensions
+// Returns: vec2 with width:x and height: y
+vec2 render::calculate_text_size(string text);
+
+// Draws regular text
+void render::draw_text(int x, int y, string text, int r, int g, int b, int a);
+
+// Draws text with outline
+void render::draw_text_outlined(int x, int y, string text, int r, int g, int b, int a);
+
+// Draws text with drop shadow (1px down and 1px right)
+void render::draw_text_shadow(int x, int y, string text, int r, int g, int b, int a);
+```
+
+#### Rectangles
+
+```cpp
+enum box_style {
+    NORMAL,           // Simple outline
+    OUTLINED,         // Outlined box
+    FILLED,           // Filled box
+    FILLED_OUTLINED,  // Filled with outline
+    CORNERED,
+    CORNERED_FILLED
+} // Accessed -> box_style::OUTLINED
+
+// Draws a box with the given style
+// For cornered styles, 'rounding' acts as corner_ratio (0.05 - 0.45)
+// Which controls how much of each edge the corner lines cover
+void render::draw_box(
+    int x, int y, 
+    int width, int height, 
+    int r, int g, int b, int a, 
+    box_style style, float rounding
+);
+
+// Draws a gradient box (vertical or horizontal)
+void render::draw_gradient_box(
+    int x, int y, 
+    int width, int height, 
+    int r1, int g1, int b1, int a1, 
+    int r2, int g2, int b2, int a2, 
+    bool horizontal
+);
+
+// Projects a 3D bounding box to 2D screen space
+// Returns: bbox_2d with x, y, width, height, valid
+bbox_2d render::calculate_2d_bbox(
+    vec3 origin,
+    vec3 mins,
+    vec3 maxs,
+    matrix4x4 view_matrix
+);
+
+// Projects a 3D bounding box to 2D screen space using Unity coordinate system
+// Unity uses left-handed Y-up coordinates (Y is up, Z is forward, X is right)
+// Takes center and extents (half-sizes) instead of mins/maxs
+// Returns: bbox_2d with x, y, width, height, valid
+bbox_2d render::calculate_2d_bbox_unity(
+    vec3 origin,
+    vec3 center,
+    vec3 extents,
+    matrix4x4 view_matrix
+);
+```
+
+#### Lines and shapes
+
+```cpp
+// Draws a line
+void render::draw_line(
+    float x1, float y1, 
+    float x2, float y2, 
+    int r, int g, int b, int a, float thickness = 1.0f
+);
+
+// Draws a line with outline
+void render::draw_line_outlined(
+    float x1, float y1, 
+    float x2, float y2, 
+    int r, int g, int b, int a, float thickness = 1.0f
+);
+
+// Draws a circle
+void render::draw_circle(
+    float x, float y, float radius, 
+    int r, int g, int b, int a, 
+    bool filled = false, int segments = 32
+);
+
+// Draws a triangle
+void render::draw_triangle(
+    float x1, float y1, 
+    float x2, float y2, 
+    float x3, float y3, 
+    int r, int g, int b, int a, bool filled = false
+);
+```
+
+#### Polygons
+
+```cpp
+// Draws a filled concave polygon
+void render::draw_concave_poly(
+    array<vec2> points, 
+    int r, int g, int b, int a
+);
+
+// Draws a convex polygon, filled or outlined
+void render::draw_convex_poly(
+    array<vec2> points, 
+    int r, int g, int b, int a, bool filled
+);
+
+// Draws a polyline (open or closed path)
+void render::draw_polyline(
+    array<vec2> points, 
+    int r, int g, int b, int a, 
+    float thickness, bool closed
+);
+```
+
+#### Hue bar
+
+```cpp
+// Animated hue bar follows the menu animation exactly
+void render::draw_hue_bar(int x, int y, int w, int h, int r, int g, int b, int a);
+void render::draw_hue_bar_static(int x, int y, int w, int h, int r, int g, int b, int a);
+```
+
+
+# Menu
+
+#### General
+
+```cpp
+// Typedefs
+struct ui_info {
+    bool open;
+    float dpi_scale;
+    float x, y, w, h;
+    color accent;
+};
+
+struct active_bind { 
+    string category; 
+    string label; 
+}
+
+struct color {
+    int r, g, b, a;
+};
+
+bool ui::is_open();
+float ui::get_scale();
+color ui::get_accent();
+ui_info ui::get_info();
+
+// Active tabs
+string ui::get_tab();
+string ui::get_sub_tab();
+
+// Sets the config directory for the loaded script.
+// Choose a unique directory name to avoid conflicts with other scripts.
+// Once called, a config tab will appear in the UI for saving and loading configs.
+void ui::config_path(string folder_name);
+
+// Controls which side of the window area the sub-tab bar appears on.
+// middle: sub-tab bar runs along the top; categories added directly to the tab are ignored.
+// left / right: sub-tab bar appears on that side; categories added directly to the tab will appear on the opposite side.
+enum sub_tab_side { 
+    middle, left, right 
+};
+
+// Controls where a category is placed within the tab content area.
+// automatic: categories are distributed evenly across columns (up to 2 per column).
+// left_full / right_full: occupies the full height of the left or right column.
+// left_top / left_bottom / right_top / right_bottom: occupies the top or bottom half of the left or right column; a resize grip appears between paired halves.
+enum category_pos {
+    automatic,
+    left_full, right_full,
+    left_top, left_bottom,
+    right_top, right_bottom
+};
+
+// Call ui::add_tab, ui::add_subtab, and ui::add_category before registering any elements.
+// Categories are added to the most recently created tab or sub-tab.
+// Elements are added to the most recently created category.
+void ui::add_tab(string label);
+void ui::add_tab(string label, sub_tab_side side);
+void ui::add_subtab(string label); // branches off the most recently created tab
+void ui::add_category(string label);
+void ui::add_category(string label, category_pos pos);
+bool ui::get_active_binds(array<active_bind> &out binds);
+```
+
+#### Elements
+
+```cpp
+// The config_key parameter is optional. When omitted, a key is automatically generated
+// from the element's tab, sub-tab, category, and label (lowercased and sanitized).
+// Explicit keys are useful when you need stable keys independent of label changes.
+// All callbacks for elements which support them are also optional.
+
+checkbox ui::add_checkbox(
+    string label,
+    bool default_value,
+    string config_key = ""
+);
+
+checkbox ui::add_checkbox(
+    string label,
+    bool default_value,
+    checkbox_callback@ callback = nullptr,
+    string config_key = ""
+);
+
+slider ui::add_slider(
+    string label, 
+    int default_val, 
+    int min_val, 
+    int max_val, 
+    int step, 
+    string tag = "",
+    string config_key = ""
+);
+
+// Color pickers stick to the checkbox above them by default.
+// You can have at most 3 color pickers sticking to a single checkbox.
+// By setting stick to false you can prevent a color picker from doing this.
+color_picker ui::add_color_picker(
+    string label, 
+    int r, int g, int b, int a, 
+    bool stick = true,
+    string config_key = ""
+);
+
+combobox ui::add_combobox(
+    string label, 
+    array<string> options, 
+    int default_idx,
+    string config_key = ""
+);
+
+combobox ui::add_combobox(
+    string label, 
+    array<string> options, 
+    int default_idx, 
+    combobox_callback@ callback = nullptr,
+    string config_key = ""
+);
+
+multi_select ui::add_multi_select(
+    string label, 
+    array<string> options,
+    string config_key = ""
+);
+
+button ui::add_button(
+    string label, 
+    button_callback@ callback = nullptr
+);
+```
+
+#### Element getters
+
+```cpp
+bool value = ui::get(checkbox);
+int value = ui::get(slider);
+color value = ui::get(color_picker);              // struct color { int r, g, b, a; }
+uint64 value = ui::get(combobox);                 // selected index
+bool value = ui::get(multi_select, uint64 index); // true if option at index is selected
+```
+
+#### Element setters
+
+```cpp
+ui::set(checkbox, bool value);
+ui::set(slider, int value);
+ui::set(color_picker, color value);
+ui::set(combobox, uint64 index);
+ui::set(multi_select, uint64 index, bool value);
+```
+
+#### Element visibility
+
+```cpp
+ui::set_visible(checkbox, bool visible);
+ui::set_visible(slider, bool visible);
+ui::set_visible(color_picker, bool visible);
+ui::set_visible(combobox, bool visible);
+ui::set_visible(multi_select, bool visible);
+ui::set_visible(button, bool visible);
+```
+
+#### Element tooltips & style
+
+```cpp
+ui::add_tooltip(checkbox, string text);
+ui::add_tooltip(slider, string text);
+ui::add_tooltip(color_picker, string text);
+ui::add_tooltip(combobox, string text);
+ui::add_tooltip(multi_select, string text);
+
+// Checkbox label styling
+enum label_style {
+    none, // default white
+    warning, // orange color
+    dangerous // red color
+};
+
+ui::set_label_style(checkbox, label_style style);
+```
+
+#### Multi-select example
+
+```cpp
+multi_select filters = ui::add_multi_select("Filters", {"Visible", "Dormant", "Dead"});
+bool show_visible = ui::get(filters, 0); // true if "Visible" is checked
+bool show_dormant = ui::get(filters, 1); // true if "Dormant" is checked
+bool show_dead = ui::get(filters, 2);    // true if "Dead" is checked
+```
+
+#### Callback example
+
+```cpp
+void on_click() {
+    alert::show("Hello World!");
+}
+
+void on_checkbox_changed(bool val) {
+    alert::show("Checkbox: " + val);
+}
+
+void on_combobox_changed(int idx) {
+    alert::show("Combobox: " + idx);
+}
+
+bool main() {
+    ui::add_tab("Test");
+    ui::add_category("Test");
+    ui::add_button("Click me", @on_click);
+    ui::add_checkbox("Toggle", false, @on_checkbox_changed);
+    ui::add_combobox("Mode", {"Option A", "Option B", "Option C"}, 0, @on_combobox_changed);
+    return true;
+}
+```
+
+
+# General
+
+```cpp
+// Returns forum username
+string util::get_username();
+
+// Unlocks anti-capture menu element
+void util::disable_capture_protection();
+
+// Wide string to UTF-8
+string util::wide_to_string(array<uint8> bytes, bool stop_at_null = false);
+
+// Formats an integer as a hex string; prefix prepends "0x"
+string util::to_hex(number, bool prefix = true);
+
+// System time
+uint64 util::tickcount();                       // Milliseconds since system boot
+string util::system_time(bool use_12h = false); // Current time as "16:32" or "4:32 PM"
+
+// Precise timing
+uint64 util::time_now();
+double util::time_ms(uint64 start, uint64 end); // Elapsed milliseconds
+double util::time_us(uint64 start, uint64 end); // Elapsed microseconds
+double util::time_ns(uint64 start, uint64 end); // Elapsed nanoseconds
+
+// Random — range [min, max]
+// Seed with 0 to reset to default, any non-zero value for a custom sequence
+void util::seed_random(uint64 seed);
+int util::random_int(int min, int max);
+float util::random_float(float min, float max);
+double util::random_double(double min, double max);
+int64  util::random_i64(int64 min, int64 max);
+uint64 util::random_u64(uint64 min, uint64 max);
+
+// Encoding — returns empty string on decode failure
+// Encodes a string or byte array to lowercase hex. "Hello" → "48656c6c6f"
+string util::hex_encode(string str);
+string util::hex_encode(array<uint8> bytes);
+
+// Decodes a hex string or byte array to a string. "48656c6c6f" → "Hello"
+// Returns empty string on failure.
+string util::hex_decode(string str);
+string util::hex_decode(array<uint8> bytes);
+
+// Encodes a string or byte array to base64. "Hello" → "SGVsbG8="
+string util::base64_encode(string str);
+string util::base64_encode(array<uint8> bytes);
+
+// Decodes a base64 string or byte array to a string. "SGVsbG8=" → "Hello"
+// Returns empty string on failure.
+string util::base64_decode(string str);
+string util::base64_decode(array<uint8> bytes);
+
+// Hashing
+uint64 hash::fnv1a(string str); // 64-bit FNV-1a hash
+uint32 hash::crc32(string str); // 32-bit CRC32 hash
+
+// Zip parsing must be flat (no subdirectories), directory entries are skipped entirely
+// Parses a raw zip binary (e.g. from http::get or file::read) and returns all file entries
+// File writes still go through the filesystem api
+struct zip_entry {
+    string name; // filename without directory
+    string data; // raw file contents
+}
+
+array<zip_entry>@ util::zip_parse(string data);
+```
+
+#### String formatting
+
+```cpp
+// Format a string using {} placeholders.
+// Basic usage:
+//   {}        next argument
+//   {0}       argument by index
+//   {{        literal {
+//   }}        literal }
+
+// Format options (after a colon):
+//   {:<8}     left-align, width 8
+//   {:>8}     right-align, width 8 (default)
+//   {:08}     zero-pad, width 8
+//   {:.2}     2 decimal places
+//   {0:<8.2}  index + alignment + width + precision
+
+// Shorthand (no colon needed):
+//   {.2}      precision only
+//   {0.3}     index + precision
+
+// Invalid or out-of-range placeholders produce {?}
+// Width is capped at 1024, precision at 17.
+// Up to 8 arguments supported.
+string util::format_string(string fmt, ...);
+```
+
+
+# Logging
+
+```cpp
+void alert::show(string msg);
+void alert::show(string msg, int r, int g, int b);
+void alert::show(string msg, int r, int g, int b, float duration);
+void alert::show(string msg, int r, int g, int b, float duration, bool rainbow);
+
+// Tagged alerts
+// Updates existing alert with the same tag instead of creating a new one
+void alert::show_tag(string msg, string tag);
+void alert::show_tag(string msg, string tag, int r, int g, int b);
+void alert::show_tag(string msg, string tag, int r, int g, int b, float duration);
+void alert::show_tag(string msg, string tag, int r, int g, int b, float duration, bool rainbow);
+
+void alert::dismiss(); // Clear all alerts 
+void alert::dismiss(string tag); // Dismiss a specific tagged alert
+
+// Console logging
+// ? = accepts any type, auto-converts to string
+void print(? msg);
+
+void console::log(? msg);
+void console::log(? msg, int r, int g, int b);
+void console::warn(? msg);
+void console::error(? msg);
+void console::clear();
+```
+
+#### Usage example
+
+```cpp
+alert::show("Hello World");
+alert::show("Custom Color", 255, 100, 100);
+alert::show("5 Second Alert", 255, 255, 255, 5.0);
+alert::show("Rainbow Alert", 255, 255, 255, 5.0, true);
+
+// Tagged alert — subsequent calls update the same alert
+alert::show_tag("Health: 100", "health_alert", 0, 255, 0);
+alert::show_tag("Health: 50", "health_alert", 255, 255, 0);
+alert::dismiss("health_alert");
+
+console::log("Custom message", 100, 200, 255);
+console::warn("Something looks off");
+console::error("Something went wrong");
+console::clear();
+
+print("Quick message");
+print(42);
+print(true);
+```
+
+
+# Filesystem
+
+```cpp
+// Sandboxed file I/O, paths are relative to the data directory, max file size: 512mb.
+// Directory depth: 2 levels, executable extensions are blocked.
+bool file::exists(string filename);
+bool file::write(string filename, string data);
+bool file::append(string filename, string data);
+bool file::read(string filename, string &out data);
+bool file::remove(string filename);
+bool file::size(string filename, uint64 &out size);
+
+// Binary I/O; read_bytes returns null on failure.
+bool file::write_bytes(string filename, array<uint8> data);
+bool file::append_bytes(string filename, array<uint8> data);
+array<uint8>@ file::read_bytes(string filename);
+
+// Directory management, limited to one level deep inside the data directory.
+bool dir::exists(string name);
+bool dir::create(string name);
+bool dir::remove(string name);
+array<string>@ dir::list(string name);
+```
+
+
+# Input \[WinAPI]
+
+#### Mouse
+
+```cpp
+void input::mouse_move(int x, int y);
+bool input::mouse_press();
+bool input::mouse_release();
+bool input::mouse_click();
+void input::mouse_pos(int &out x, int &out y);
+```
+
+#### Keyboard
+
+```cpp
+bool input::key_active(int vk_code);   // True while key is held
+bool input::key_toggled(int vk_code);  // True if key is toggled on (e.g. caps lock)
+void input::key_press(int vk_code);    // Send key down
+void input::key_release(int vk_code);  // Send key up
+void input::key_tap(int vk_code);      // Send key down + up atomically
+```
+
+
+# JSON Serialization
+
+A JSON parsing and building API using a single object type for both objects and arrays.
+
+#### JSON types
+
+```cpp
+// enum used for type inspection
+json_type::null_value
+json_type::boolean
+json_type::number
+json_type::string
+json_type::object
+json_type::array
+```
+
+#### JSON object
+
+```cpp
+// Inspection
+bool has(string key)           // check if key exists
+uint length()                  // number of keys (object) or elements (array)
+json_type type(string key)     // type of value at key
+json_type type_at(uint index)  // type of value at index
+array<string>@ keys()          // all keys in the object
+
+// Key-based getters
+// Returns default value if key missing or type mismatch
+string get_string(string key)
+float get_float(string key)
+double get_double(string key)
+int get_int(string key)
+uint get_uint(string key)
+int64 get_int64(string key)
+uint64 get_uint64(string key)
+bool get_bool(string key)
+json_obj@ get_obj(string key) // returns null if key missing or not an object/array
+
+// Index-based getters
+// Returns default value if out of range or type mismatch
+string get_string_at(uint index)
+float get_float_at(uint index)
+double get_double_at(uint index)
+int get_int_at(uint index)
+uint get_uint_at(uint index)
+int64 get_int64_at(uint index)
+uint64 get_uint64_at(uint index)
+bool get_bool_at(uint index)
+json_obj@ get_obj_at(uint index) // returns null if out of range or not an object/array
+
+// Key-based setters — overwrites existing key if already present
+void set(string key, string value)
+void set(string key, float value)
+void set(string key, double value)
+void set(string key, int value)
+void set(string key, uint value)
+void set(string key, int64 value)
+void set(string key, uint64 value)
+void set(string key, bool value)
+void set(string key, json_obj@ value)
+void set_null(string key)
+void remove(string key) // no-op if key doesn't exist
+
+// Array push — only valid on objects created with json::array(), no-op otherwise
+void push(string value)
+void push(float value)
+void push(double value)
+void push(int value)
+void push(uint value)
+void push(int64 value)
+void push(uint64 value)
+void push(bool value)
+void push(json_obj@ value) // pushes a nested object or array
+void push_null()
+```
+
+#### Global functions
+
+```cpp
+// Construct a json_obj in array mode — use push() to append, get_*_at() to read
+json_obj@ json::array()
+
+// Parse a JSON string into a json_obj, returns null on failure with reason in error
+json_obj@ json::parse(string text, string &out error)
+
+// Serialize a json_obj to a JSON string, set beautify to true for indented output
+string json::stringify(json_obj@ obj, bool beautify = false)
+```
+
+#### Usage example
+
+```cpp
+bool main() {
+    // alice builds a message
+    json_obj@ msg = json_obj();
+    msg.set("from", "alice");
+    msg.set("to", "bob");
+    msg.set("text", "meet me at midnight");
+    msg.set("encrypted", false);
+    msg.set("attempts", 1);
+    msg.set("confidence", 0.98f);
+    msg.set_null("session_key");
+
+    json_obj@ ciphers = json::array();
+    ciphers.push("aes-256");
+    ciphers.push("rsa-2048");
+    msg.set("ciphers", ciphers);
+
+    print("alice sends:");
+    print(json::stringify(msg, true));
+
+    // bob receives it
+    string err;
+    json_obj@ received = json::parse(json::stringify(msg), err);
+    if (received is null)
+    {
+        print("parse failed: " + err);
+        return false;
+    }
+
+    // bob reads each field
+    array<string>@ keys = received.keys();
+    print("bob reads:");
+    for (uint i = 0; i < keys.length(); i++)
+    {
+        string k = keys[i];
+        json_type t = received.type(k);
+        switch (t)
+        {
+        case json_type::string:
+            print(k + ": \"" + received.get_string(k) + "\"");
+            break;
+        case json_type::number:
+            print(k + ": " + received.get_float(k));
+            break;
+        case json_type::boolean:
+            print(k + ": " + received.get_bool(k));
+            break;
+        case json_type::null_value:
+            print(k + ": null");
+            break;
+        case json_type::array:
+        {
+            json_obj@ arr = received.get_obj(k);
+            for (uint j = 0; j < arr.length(); j++)
+            {
+                print(k + "[" + j + "]: \"" + arr.get_string_at(j) + "\"");
+            }
+            break;
+        }
+        }
+    }
+
+    // bob replies with a session key
+    json_obj@ reply = json_obj();
+    reply.set("from", "bob");
+    reply.set("to", "alice");
+    reply.set("text", "understood");
+    reply.set("encrypted", true);
+    reply.set("cipher", "aes-256");
+    reply.set("session_key", "f3a1b9c2");
+    reply.set("confidence", 1.0f);
+
+    print("bob replies:");
+    print(json::stringify(reply, true));
+
+    return true;
+}
+```
+
+
+# Hash set
+
+A hash set for fast O(1) insert, lookup, and removal of unique values.
+
+```cpp
+// Available types
+hash_set_float@  hash_set_float()
+hash_set_double@ hash_set_double()
+hash_set_int32@  hash_set_int32()
+hash_set_uint32@ hash_set_uint32()
+hash_set_int64@  hash_set_int64()
+hash_set_uint64@ hash_set_uint64()
+
+// Methods
+bool .insert(value)   // Insert value — returns true if inserted, false if already exists
+bool .erase(value)    // Remove value — returns true if removed, false if not found
+bool .contains(value) // Returns true if value exists
+uint .size()          // Returns number of elements
+bool .empty()         // Returns true if empty
+void .clear()         // Remove all elements
+```
+
+#### Usage example
+
+```cpp
+hash_set_uint64@ entity_cache = create_hash_set_uint64();
+
+entity_cache.insert(entity_id);
+
+if (!entity_cache.contains(entity_id)) {
+    // first time seeing this entity
+}
+
+entity_cache.erase(entity_id);
+entity_cache.clear();
+```
+
+
+# Hash map
+
+A fast dynamically typed key-value map with uint64 keys, supporting bool, integers, floats, and strings.
+
+#### Map types
+
+```cpp
+// enum used for type inspection
+hmap_type::unset
+hmap_type::boolean
+hmap_type::i32
+hmap_type::u32
+hmap_type::i64
+hmap_type::u64
+hmap_type::f32 // float
+hmap_type::f64 // double
+hmap_type::string
+```
+
+```cpp
+hash_map@ create_hash_map()
+
+// Setters — overwrites any existing value at that key
+void .set_bool(uint64 key, bool value)
+void .set_int32(uint64 key, int32 value)
+void .set_uint32(uint64 key, uint32 value)
+void .set_int64(uint64 key, int64 value)
+void .set_uint64(uint64 key, uint64 value)
+void .set_float(uint64 key, float value)
+void .set_double(uint64 key, double value)
+void .set_string(uint64 key, string value)
+
+// Getters — returns true if key exists and type matches, false otherwise
+bool .get_bool(uint64 key, bool &out)
+bool .get_int32(uint64 key, int32 &out)
+bool .get_uint32(uint64 key, uint32 &out)
+bool .get_int64(uint64 key, int64 &out)
+bool .get_uint64(uint64 key, uint64 &out)
+bool .get_float(uint64 key, float &out)
+bool .get_double(uint64 key, double &out)
+bool .get_string(uint64 key, string &out)
+
+// Operations
+bool .contains(uint64 key) // Returns true if key exists regardless of type
+bool .erase(uint64 key)    // Returns true if removed, false if not found
+hmap_type .get_type(uint64 key)
+uint .size()
+bool .empty()
+void .clear()
+```
+
+#### Usage example
+
+```cpp
+hash_map@ map = create_hash_map();
+
+map.set_string(1, "hello");
+map.set_int32(2, 42);
+map.set_float(3, 3.14f);
+
+string s;
+if (map.get_string(1, s)) {
+    print("string: " + s);
+}
+
+int32 i;
+if (map.get_int32(2, i)) {
+    print("int: " + i);
+}
+
+hmap_type t = map.get_type(3);
+if (t == hmap_type::float) {
+    print("key 3 is a float");
+}
+
+print("size: " + map.size());
+
+map.erase(1);
+map.clear();
+```
+
+
+# Async HTTP
+
+Requests are non-blocking — instead of returning a value directly, you pass a callback function.
+
+```cpp
+// Requests are asynchronous and only callable from main().
+// User-agent: prism/1.0
+// Timeout: 10s
+// Redirects are followed automatically.
+
+struct http_response {
+    int status_code;
+    string body;
+    string error;
+}
+
+// callback funcdef
+void response_callback(http_response@ response) {}
+
+// Async HTTP - fires request on a background thread, invokes callback on completion.
+// Only callable from main().
+void http::get(string url, response_callback@ cb);
+void http::post(string url, string body, string content_type, response_callback@ cb);
+
+// Fire-and-forget requests: no callback, no response.
+// Callable from any context, including on_unload().
+// Intended for webhooks and one-way notifications where you don't need a response.
+void http::get(string url);
+void http::post(string url, string body, string content_type);
+```
+
+#### Usage example
+
+```cpp
+void on_response(http_response@ res) {
+    if (res.error != "") {
+        print("GET error: " + res.error);
+        return;
+    }
+
+    print("GET status: " + res.status_code);
+    print(res.body);
+}
+
+bool main() {
+    // Named callback
+    http::get("https://httpbin.org/get", @on_response);
+
+    // Inline callback
+    http::post("https://httpbin.org/post", "{\"hello\": \"world\"}", "application/json", function(http_response@ res) {
+        if (res.error != "") {
+            print("POST error: " + res.error);
+            return;
+        }
+
+        print("POST status: " + res.status_code);
+        print(res.body);
+    });
+
+    return true;
+}
+```
+
+
+# WebSocket
+
+A persistent WebSocket client with callbacks for open, message, disconnect, and error events. All callbacks fire on a separate connection thread.
+
+```cpp
+// All callbacks fire on the connection thread, remember to protect any shared state.
+// callback funcdefs
+void connect_callback() {}
+void message_callback(string msg) {}
+void disconnect_callback() {}
+void error_callback(string msg) {}
+
+void ws::connect(
+    string url,
+    connect_callback@ on_open,
+    message_callback@ on_message,
+    disconnect_callback@ on_disconnect,
+    error_callback@ on_error
+);
+
+void ws::reconnect();
+void ws::disconnect();
+bool ws::is_connected();
+void ws::send(string msg);
+```
+
+#### Usage example
+
+```cpp
+int pong_count = 0;
+
+void on_open() {
+    print("connected");
+    ws::send("hello echo");
+    ws::send("second message");
+    ws::send("{\"type\": \"ping\", \"id\": 1}");
+}
+
+void on_message(string msg) {
+    pong_count++;
+    print("[" + pong_count + "] echo: " + msg);
+
+    if (pong_count == 3) {
+        ws::disconnect();
+    }
+}
+
+void on_disconnect() {
+    print("disconnected");
+    ws::reconnect();
+}
+
+void on_error(string msg) {
+    print("error: " + msg);
+}
+
+bool main() {
+    ws::connect("wss://echo.websocket.org", @on_open, @on_message, @on_disconnect, @on_error);
+    return true;
+}
+```
+
+
+# Clipping
+
+2D polygon boolean operations, offsetting, and path simplification.
+
+#### Enums
+
+```cpp
+enum clip_type {
+    INTERSECTION,
+    UNION,
+    DIFFERENCE,
+    XOR
+}
+
+enum fill_rule {
+    EVEN_ODD,
+    NON_ZERO,
+    POSITIVE,
+    NEGATIVE
+}
+
+enum join_type {
+    MITER,
+    SQUARE,
+    BEVEL,
+    ROUND
+}
+
+enum end_type {
+    ET_POLYGON,
+    ET_JOINED,
+    ET_BUTT,
+    ET_SQUARE,
+    ET_ROUND
+}
+```
+
+#### Clipping Paths
+
+```cpp
+// ref-counted container for a set of paths (polygons/polylines)
+// operations mutate the object in place
+clip_paths@ clip_paths();
+
+// add a path (polygon or polyline) from an array of points
+void clip_paths.add_path(const array<vec2> &in points);
+
+// returns the path at the given index as an array of points
+array<vec2>@ clip_paths.get_path(uint index);
+
+// returns the number of paths in this object
+uint clip_paths.path_count();
+
+// removes all paths
+void clip_paths.clear();
+
+// returns a new clip_paths object with a copy of all paths
+clip_paths@ clip_paths.clone();
+
+// boolean operation against another set of paths, mutates this object
+void clip_paths.boolean_op(
+    clip_paths@ clips,
+    clip_type,
+    fill_rule = NON_ZERO
+);
+
+// inflate (outset) or deflate (inset) all paths by delta units
+// use ET_POLYGON for closed polygons, ET_BUTT/ET_ROUND for open polylines
+// join_type controls how corners are handled
+void clip_paths.inflate(
+    double delta,
+    join_type = ROUND,
+    end_type = ET_POLYGON
+);
+
+// simplify paths by removing vertices 
+// within epsilon distance of their neighbors
+void clip_paths.simplify(double epsilon = 0.1);
+
+// merge all overlapping paths within the object into a single set
+// useful for cleaning up self-intersecting or overlapping input before drawing
+void clip_paths.union_self(fill_rule = NON_ZERO);
+```
+
+#### Example
+
+```cpp
+void render_tick() {
+    array<vec2> outer_rect = {
+        vec2(100, 100),
+        vec2(200, 100),
+        vec2(200, 200),
+        vec2(100, 200)
+    };
+    
+    array<vec2> inner_rect = {
+        vec2(150, 150),
+        vec2(250, 150),
+        vec2(250, 250),
+        vec2(150, 250)
+    };
+
+    clip_paths@ paths = clip_paths();
+    clip_paths@ cutout = clip_paths();
+    paths.add_path(outer_rect);
+    cutout.add_path(inner_rect);
+    paths.boolean_op(cutout, DIFFERENCE);
+
+    for (uint i = 0; i < paths.path_count(); i++) {
+        render::draw_polyline(paths.get_path(i), 255, 255, 0, 255, 1.0f, true);
+    }
+}
+
+bool main() {
+    on_render(@render_tick);
+    return true;
+}
+```
+
+
+# Tracing
+
+Ray and geometry intersection utilities, including a BVH tree for fast occlusion queries.
+
+#### Registered types
+
+```cpp
+struct triangle {
+    vec3 p1;
+    vec3 p2;
+    vec3 p3;
+}
+```
+
+#### **BVH Tree**
+
+```cpp
+// ref-counted BVH tree for ray occlusion queries
+// add triangles, call build(), then query with is_occluded()
+// thread-safe: multiple threads may call is_occluded() concurrently
+// any mutation invalidates the tree until build() is called again
+
+// returns null on allocation failure
+bvh_tree@ create_bvh_tree();
+
+// add one or more triangles to the tree
+void bvh_tree.add_triangle(const vec3 &in p1, const vec3 &in p2, const vec3 &in p3);
+void bvh_tree.add_triangles(const array<triangle> &in tris);
+
+// build the tree, returns false if no triangles have been added
+bool bvh_tree.build();
+
+// returns true if the segment from->to is blocked by any triangle
+// returns false if the tree is not built
+bool bvh_tree.is_occluded(const vec3 &in from, const vec3 &in to);
+
+// remove all triangles and nodes
+// resets tree to an unbuilt state
+void bvh_tree.clear();
+
+// returns the number of triangles in the tree
+uint64 bvh_tree.triangle_count();
+
+// returns true if build() has been called and no mutations have occurred since
+bool bvh_tree.is_ready();
+```
+
+#### **One-off intersection tests**
+
+```cpp
+// Moller-Trumbore intersection, returns true if the ray hits the triangle within max_t
+bool trace::ray_triangle(
+    const triangle &in tri,
+    const vec3 &in origin,
+    const vec3 &in dir,
+    double max_t
+);
+
+// Slab method AABB intersection, returns true if the ray hits the box within max_t
+bool trace::ray_bbox(
+    const vec3 &in origin,
+    const vec3 &in dir,
+    const vec3 &in box_min,
+    const vec3 &in box_max
+    double max_t,
+);
+
+// Analytic sphere intersection, returns true if the ray hits the sphere within max_t
+bool trace::ray_sphere(
+    const vec3 &in origin,
+    const vec3 &in dir,
+    const vec3 &in center,
+    double radius,
+    double max_t
+);
+
+// Closest-point capsule intersection, returns true if the ray hits the capsule within max_t
+// cap_min and cap_max are the two endpoint centers of the capsule axis
+bool trace::ray_capsule(
+    const vec3 &in origin,
+    const vec3 &in dir,
+    const vec3 &in capsule_min,
+    const vec3 &in capsule_max,
+    double radius,
+    double max_t
+);
+```
+
+#### **Example: Occlusion query**
+
+```cpp
+bool main() {
+    bvh_tree@ tree = create_bvh_tree();
+
+    tree.add_triangle(
+        vec3(-100.0, 0.0, -100.0), 
+        vec3(100.0, 0.0, -100.0), 
+        vec3(0.0, 0.0, 100.0)
+    );
+
+    if (!tree.build()) {
+        return false;
+    }
+
+    vec3 camera_pos = vec3(0.0, 10.0, 0.0);
+    vec3 target_pos = vec3(0.0, 0.0, 0.0);
+
+    if (tree.is_occluded(camera_pos, target_pos)) {
+        print("target is behind geometry");
+    } 
+    else {
+        print("target is visible");
+    }
+
+    return true;
+}
+```
+
+#### **Example: Bulk load from mesh data**
+
+```cpp
+bool main() {
+    bvh_tree@ tree = create_bvh_tree();
+
+    array<triangle> tris;
+    tris.insertLast(triangle(vec3(-1.0, 0.0, 0.0), vec3(1.0, 0.0, 0.0), vec3(0.0, 1.0, 0.0)));
+    tris.insertLast(triangle(vec3(-1.0, 0.0, 1.0), vec3(1.0, 0.0, 1.0), vec3(0.0, 1.0, 1.0)));
+    tree.add_triangles(tris);
+    tree.build();
+    return true;
+}
+```
+
+
+# Helpers
+
+#### Constants
+
+```cpp
+math::PI
+math::TAU     // (2 * PI)
+math::RAD2DEG // (180 / PI)
+math::DEG2RAD // (PI / 180)
+
+// Angle ranges
+angle_range::R_180 // Normalize to [-180, 180]
+angle_range::R_360 // Normalize to [0, 360]
+```
+
+#### Matrix operations
+
+```cpp
+// Multiply two 4x4 matrices
+matrix4x4 math::multiply_matrix(matrix4x4 a, matrix4x4 b);
+
+// Create rotation matrix from euler angles and origin
+matrix4x4 math::rotation_matrix(vec3 rotation, vec3 origin);
+
+// Rotate a point by a quaternion
+vec3 math::rotated_vector(vec3 point, vec4 quaternion);
+```
+
+#### Vector direction
+
+```cpp
+// Get forward vector from angles (pitch, yaw)
+vec3 math::forward_vector(vec2 angles);
+
+// Get right vector from angles (pitch, yaw)
+vec3 math::right_vector(vec2 angles);
+
+// Get up vector from angles (pitch, yaw)
+vec3 math::up_vector(vec2 angles);
+```
+
+#### Angle helpers
+
+```cpp
+// Convert direction vector to angles (pitch, yaw)
+vec2 math::vec_to_angles(vec3 direction);
+
+// Convert angles (pitch, yaw) to direction vector
+vec3 math::angles_to_vec(vec2 angles);
+
+// Normalize angle to specified range
+double math::normalize_angle(double angle, angle_range range);
+
+// Calculate shortest angular difference between two angles
+double math::angle_diff(double a, double b);
+
+// Calculate FOV (field of view) between two sets of angles
+double math::calculate_fov(vec2 a, vec2 b);
+
+// Calculate angles from one position to another
+vec2 math::calculate_angle(vec3 from, vec3 to);
+
+// Clamp angles to valid range (pitch: -89 to 89, yaw: normalized)
+vec2 math::clamp_angles(vec2 angles, angle_range range);
+
+// Smooth angle transition with configurable speed
+// Automatically clamps and normalizes the angles
+// Adjust min, max speed according to how fast ur thread runs
+// Smoothing: 0.0 = fast, 1.0 = slow
+vec2 math::smooth_angles(
+    vec2 current,
+    vec2 target,
+    angle_range range,
+    double smoothing [0.0 - 1.0],
+    double min_speed [1.0 - 45.0],
+    double max_speed [1.0 - 45.0]
+);
+```
+
+### Unreal helpers
+
+```cpp
+// Convert Unreal rotation components (a, b, c) to pitch/yaw angles in radians
+// Returns: vec2(pitch_radians, yaw_radians)
+vec2 math::unreal_rotation_to_radians(vec3 camera_rot);
+
+// Calculate FOV in degrees between current rotation and a target world position
+// Returns: FOV angle in degrees (0 = looking directly at target)
+double math::unreal_calculate_fov(vec3 camera_rot, vec3 camera_pos, vec3 target_pos);
+
+// Returns the direct angle delta in degrees to add to current rotation
+vec2 math::unreal_calculate_angle(vec3 camera_rot, vec3 camera_pos, vec3 target_pos);
+
+// Returns smoothed deltas in radians to add to current rotation
+// Adjust min, max speed according to how fast ur thread runs
+// Smoothing: 0.0 = fast, 1.0 = slow
+vec2 math::unreal_smooth_rotation(
+    vec3 camera_rot,
+    vec3 camera_pos,
+    vec3 target_pos,
+    double smoothing [0.0 - 1.0],
+    double min_speed [1.0 - 45.0],
+    double max_speed [1.0 - 45.0]
+);
+```
+
+#### Examples
+
+```cpp
+// Calculate aim angles from your position to a target
+vec3 my_pos = vec3(100, 200, 50);
+vec3 target_pos = vec3(500, 300, 75);
+vec2 aim_angles = math::calculate_angle(my_pos, target_pos);
+// Returns vec2(pitch, yaw) pointing at target
+
+// Smooth camera movement towards target angles
+vec2 current_angles = vec2(0, 90);
+vec2 target_angles = vec2(10, 120);
+double smoothing = 0.3; // 0.0 = fast, 1.0 = slow
+vec2 smooth_angles = math::smooth_angles(current_angles, target_angles, smoothing, angle_range::R_180);
+
+// Project a ray forward from view angles
+vec2 view_angles = vec2(0, 90); // Pitch: 0°, Yaw: 90°
+vec3 forward_dir = math::forward_vector(view_angles);
+vec3 target = my_pos.add(forward_dir.multiply(100));
+// Returns position 100 units ahead
+
+// Fix invalid angles
+vec2 raw_angles = vec2(95, 450); // Pitch too high, yaw > 360
+vec2 clamped = math::clamp_angles(raw_angles, angle_range::R_180);
+// Returns: vec2(89, 90)
+// Pitch clamped to valid range [-89, 89]
+// Yaw normalized: 450° - 360° = 90° (same direction, valid range)
+```
+
+
+# Vector \[2D]
+
+```cpp
+vec2 v2 = vec2(10, 20);
+v2.x, v2.y // Access components
+
+// Methods
+v2.is_empty();           // Returns true if vector is zero
+v2.length();             // Get magnitude
+v2.length_squared();     // Get squared magnitude (faster, no sqrt)
+v2.normalize();          // Get normalized vector (length = 1)
+v2.dot(other_vec2);      // Dot product
+
+// Operations
+v2.add(other_vec2);      // Add vectors
+v2.subtract(other_vec2); // Subtract vectors
+v2.multiply(scalar);     // Multiply by scalar
+v2.distance(other_vec2); // Distance to another vector
+v2.lerp(other_vec2, t);  // Linear interpolation (t: 0.0 to 1.0)
+
+// Memory operations
+v2.read_float(address);  // Read from memory as float[2]
+v2.read_double(address); // Read from memory as double[2]
+v2.write_float(address); // Write to memory as float[2]
+v2.write_double(address);// Write to memory as double[2]
+```
+
+
+# Vector \[3D]
+
+```cpp
+vec3 v3 = vec3(10, 20, 30);
+v3.x, v3.y, v3.z // Access components
+
+// Methods
+v3.is_empty();           // Returns true if vector is zero
+v3.length();             // Get magnitude
+v3.length_squared();     // Get squared magnitude (faster, no sqrt)
+v3.normalize();          // Get normalized vector (length = 1)
+v3.dot(other_vec3);      // Dot product
+
+// Operations
+v3.add(other_vec3);      // Add vectors
+v3.subtract(other_vec3); // Subtract vectors
+v3.multiply(scalar);     // Multiply by scalar
+v3.distance(other_vec3); // Distance to another vector
+v3.lerp(other_vec3, t);  // Linear interpolation (t: 0.0 to 1.0)
+
+// Memory operations
+v3.read_float(address);  // Read from memory as float[3]
+v3.read_double(address); // Read from memory as double[3]
+v3.write_float(address); // Write to memory as float[3]
+v3.write_double(address);// Write to memory as double[3]
+```
+
+
+# Vector \[4D]
+
+```cpp
+vec4 v4 = vec4(10, 20, 30, 40);
+v4.x, v4.y, v4.z, v4.w // Access components
+
+// Methods
+v4.is_empty();           // Returns true if vector is zero
+v4.length();             // Get magnitude
+v4.length_squared();     // Get squared magnitude (faster, no sqrt)
+v4.normalize();          // Get normalized vector (length = 1)
+v4.dot(other_vec4);      // Dot product
+
+// Operations
+v4.add(other_vec4);      // Add vectors
+v4.subtract(other_vec4); // Subtract vectors
+v4.multiply(scalar);     // Multiply by scalar
+v4.distance(other_vec4); // Distance to another vector
+v4.lerp(other_vec4, t);  // Linear interpolation (t: 0.0 to 1.0)
+
+// Memory operations
+v4.read_float(address);  // Read from memory as float[4]
+v4.read_double(address); // Read from memory as double[4]
+v4.write_float(address); // Write to memory as float[4]
+v4.write_double(address);// Write to memory as double[4]
+```
+
+
+# Matrixes
+
+#### Matrix \[4x4]
+
+```cpp
+matrix4x4 m4 = matrix4x4();
+
+// Access individual elements
+float value = m4[1][1];
+m4[2][3] = 5.0;
+
+// Set individual elements
+m4[0][0] = 1.0;
+m4[0][1] = 0.0;
+m4[0][2] = 0.0;
+m4[0][3] = 0.0;
+m4[1][0] = 0.0;
+m4[1][1] = 1.0;
+m4[1][2] = 0.0;
+m4[1][3] = 0.0;
+m4[2][0] = 0.0;
+m4[2][1] = 0.0;
+m4[2][2] = 1.0;
+m4[2][3] = 0.0;
+m4[3][0] = 0.0;
+m4[3][1] = 0.0;
+m4[3][2] = 0.0;
+m4[3][3] = 1.0;
+
+// Read matrix from memory (float)
+bool success = m4.read(address);
+
+// Read matrix from memory (double)
+bool success = m4.read_double(address);
+```
+
+#### Matrix \[3x4]
+
+```cpp
+matrix3x4 m3 = matrix3x4();
+
+// Access individual elements
+float value = m3[1][1];
+m3[2][3] = 5.0;
+
+// Set individual elements
+m3[0][0] = 1.0;
+m3[0][1] = 0.0;
+m3[0][2] = 0.0;
+m3[0][3] = 0.0;
+m3[1][0] = 0.0;
+m3[1][1] = 1.0;
+m3[1][2] = 0.0;
+m3[1][3] = 0.0;
+m3[2][0] = 0.0;
+m3[2][1] = 0.0;
+m3[2][2] = 1.0;
+m3[2][3] = 0.0;
+
+// Read matrix from memory (float)
+bool success = m3.read(address);
+
+// Read matrix from memory (double)
+bool success = m3.read_double(address);
+```
+
+### Matrix \[3x3]
+
+```cpp
+matrix3x3 m3 = matrix3x3();
+
+// Access individual elements
+float value = m3[1][1];
+m3[2][2] = 5.0;
+
+// Set individual elements
+m3[0][0] = 1.0;
+m3[0][1] = 0.0;
+m3[0][2] = 0.0;
+
+m3[1][0] = 0.0;
+m3[1][1] = 1.0;
+m3[1][2] = 0.0;
+
+m3[2][0] = 0.0;
+m3[2][1] = 0.0;
+m3[2][2] = 1.0;
+
+// Read matrix from memory (float)
+bool success = m3.read(address);
+
+// Read matrix from memory (double)
+bool success = m3.read_double(address);
+```
+
+
+# Source engine
+
+```cpp
+// Source engine
+// Converts 3D world position to 2D screen coordinates
+// Returns: true if successful, false if off-screen or behind camera
+bool source::w2s(vec3 world_pos, matrix4x4 view_matrix, vec2 &out screen_pos)
+
+// Retrieves entity address from entity list
+// Returns: Entity address, or 0 if invalid
+uint64 source::get_entity(uint64 entity_list_address, uint64 index)
+
+// Source 2 engine
+// Converts 3D world position to 2D screen coordinates
+// Returns: true if successful, false if off-screen or behind camera
+bool source2::w2s(vec3 world_pos, matrix4x4 view_matrix, vec2 &out screen_pos)
+
+// Retrieves controller address from entity list
+// Returns: Controller address, or 0 if invalid
+uint64 source2::get_controller(uint64 entity_list_address, uint64 index)
+
+// Retrieves pawn address from controller
+// Returns: Pawn address, or 0 if invalid
+uint64 source2::get_pawn(uint64 entity_list_address, uint64 controller_address, uint64 pawn_offset)
+```
+
+
+# Unreal engine
+
+```cpp
+f_view_info view_info;
+view_info.location = vec3(0, 0, 0); // Camera world position
+view_info.rotation = vec3(0, 0, 0); // Camera rotation (pitch, yaw, roll)
+view_info.fov = 90.0f;
+
+// Builds a cached view state from a f_view_info
+// This avoids recomputing rotation matrix and fov per entity
+// Should be built once per frame before iterating entities
+// @camera: the view info to build the cache from
+// @vertical_fov: some games require a different fov solution, pass true if needed
+f_view_cache build_view_cache(f_view_info camera, bool vertical_fov = false);
+
+// Converts 3D world position to 2D screen coordinates
+// Returns: true if successful, false if off-screen or behind camera
+bool unreal::w2s(vec3 world_pos, f_view_cache cache, vec2 &out screen_pos)
+
+// Read bones using the skeletal mesh (with cached fallback)
+// Returns: u_bone_array, call valid() before use
+// bones.valid(), returns true if bones were read successfully
+// bones.count(), return number of bones in the array
+// bones[110] indexable by raw bone index
+u_bone_array unreal::read_bones(
+    uint64 skeletal_mesh,
+    uint64 bone_array_offset,
+    uint64 bone_array_cached_offset,
+    uint64 component_offset
+)
+
+// Read bones using the skeletal mesh (no cached fallback)
+// Returns: same as above, bones may flicker
+u_bone_array unreal::read_bones(
+    uint64 skeletal_mesh,
+    uint64 bone_array_offset,
+    uint64 component_offset
+)
+
+// Transform structure for bone/component transforms
+// rotation: Quaternion rotation (x, y, z, w)
+// translation: World position
+// scale_3d: Scale vector
+ftransform bone_transform;
+bone_transform.read(bone_address); // Read transform from memory
+
+// Transforms a local position to world space using parent transform
+// Returns: World space position
+vec3 pos = bone_transform.transform_to_world(ftransform parent_transform)
+```
+
+
+# Unity engine
+
+```cpp
+// Converts 3D world position to 2D screen coordinates
+// Returns: true if successful, false if off-screen or behind camera
+bool unity::w2s(vec3 world_pos, matrix4x4 view_matrix, vec2 &out screen_pos)
+
+// Gets the world position from a transform object in Rust
+// Returns: vec3 position
+vec3 unity::rust_transform_position(uint64 transform_address)
+
+// Returns a prefab ID derived from its name
+// Example input: "assets/bundled/prefabs/autospawn/resource/ores/stone-ore.prefab"
+uint32 unity::rust_prefab_id(string name);
+```
+
+
+# IW engine
+
+```cpp
+// 3x3 rotation matrix
+// Row 0: axis_forward (camera forward direction)
+// Row 1: axis_right (camera right direction)  
+// Row 2: axis_up (camera up direction)
+
+matrix3x3 view_matrix;
+view_matrix.read(address);
+
+// Converts 3D world position to 2D screen coordinates
+// Returns: true if successful, false if off-screen or behind camera
+bool iw_engine::w2s(vec3 world_pos, vec3 camera_location, matrix3x3 view_matrix, float fov_x, float fov_y, vec2 &out screen_pos)
+```
+
+
